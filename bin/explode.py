@@ -6,6 +6,7 @@ import struct
 import sys
 import zlib
 
+from argparse import ArgumentParser
 from collections import namedtuple
 from hashlib import sha1
 from os import path
@@ -53,7 +54,7 @@ STREAM_ITEM = struct.Struct('<4s5H3L2HB20s')
 JUMP_ITEM = struct.Struct('<2Q')
 
 
-def process_zip(filename):
+def process_zip(filename, depth=0, base='.'):
     with open(filename, 'rb') as file:
         try:
             file.seek(-END_OF_DIR.size, 2)
@@ -72,9 +73,10 @@ def process_zip(filename):
             eoa = END_OF_DIR.unpack(tmp[index:index + END_OF_DIR.size])
 
         for dir in ('meta', 'data'):
+            dir = path.join(base, dir)
             if not path.isdir(dir): os.makedirs(dir)
 
-        prefix = path.join('meta', path.basename(filename))
+        prefix = path.join(base, 'meta', path.basename(filename))
         with open(prefix + '.jump', 'wb') as jump:
             with open(prefix + '.stream', 'wb') as stream:
                 with open(prefix + '.dir', 'wb') as dir:
@@ -91,7 +93,8 @@ def process_zip(filename):
                         # stream location
                         jump.write(JUMP_ITEM.pack(info.offset, stream.tell()))
 
-                        process_file(file, info, stream)
+                        process_file(file, info, stream,
+                                     depth=depth, base=base)
 
                         dir.write(file.read(info.filename_len +
                                   info.extra_field_len + info.comment_len))
@@ -101,7 +104,7 @@ def process_zip(filename):
                     dir.write(file.read())
 
 
-def process_file(file, info, stream):
+def process_file(file, info, stream, depth=0, base='.'):
     pos = file.tell()
 
     # go to the local header and unpack it
@@ -116,9 +119,14 @@ def process_file(file, info, stream):
     data = file.read(info.compressed_size)
 
     sha = sha1(data)
+    digest = sha.hexdigest()
 
-    data_name = path.join('data', sha.hexdigest())
+    directory = path.join(*([base, 'data'] + list(digest[:depth])))
+    data_name = path.join(directory, digest)
     if not path.isfile(data_name):
+        if not path.isdir(directory):
+            os.makedirs(directory)
+
         with open(data_name, 'wb') as d:
             d.write(data)
 
@@ -142,6 +150,22 @@ def process_file(file, info, stream):
     file.seek(pos)
 
 
+
+
+parser = ArgumentParser(description='Splits a zip file into an exploded '
+                                    'format to reduce duplication.')
+
+parser.add_argument('-d', '--directory', metavar='DIR', default='.',
+                    help='alternate base for the exploded files')
+
+parser.add_argument('--depth', type=int, default=0,
+                    help='data subdirectory depth')
+
+parser.add_argument('filenames', metavar='FILE', nargs='+',
+                    help='zip files to process')
+
 if __name__ == '__main__':
-    for arg in sys.argv[1:]:
-        process_zip(arg)
+    args = parser.parse_args()
+
+    for filename in args.filenames:
+        process_zip(filename, depth=args.depth, base=args.directory)
