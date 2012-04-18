@@ -5,6 +5,7 @@ import errno
 import fuse
 import os
 import stat
+import threading
 import time
 
 from argparse import ArgumentParser
@@ -89,6 +90,7 @@ class ExplodedZip(Operations):
         self.__exploded_info = {}
         self.__handles = {}
         self.__fh = 0
+        self.__fh_lock = threading.Lock()
 
     def _exploded_info(self, path):
         if path in self.__exploded_info: return self.__exploded_info[path]
@@ -220,19 +222,21 @@ class ExplodedZip(Operations):
     mknod = _not_supported
 
     def open(self, path, flags):
-        raw = File(path, flags, self._exploded_info(path), fh=self.__fh,
-                   base=self.base, depth=self.depth)
+        with self.__fh_lock:
+            raw = File(path, flags, self._exploded_info(path), fh=self.__fh,
+                       base=self.base, depth=self.depth)
 
-        self.__handles[self.__fh] = BufferedReader(raw)
+            self.__handles[self.__fh] = threading.Lock(), BufferedReader(raw)
 
-        self.__fh += 1
-        return raw.fh
+            self.__fh += 1
+            return raw.fh
 
     def read(self, path, size, offset, fh):
-        reader = self.__handles[fh]
+        lock, reader = self.__handles[fh]
 
-        reader.seek(offset)
-        return reader.read(size)
+        with lock:
+            reader.seek(offset)
+            return reader.read(size)
 
     def readdir(self, path, fh):
         if path != '/':
@@ -437,6 +441,7 @@ class File(RawIOBase):
 
         # init
         self._load_stream_item()
+        self.lock = threading.Lock()
 
     def _load_stream_item(self):
         if self.data:
@@ -693,10 +698,13 @@ parser.add_argument('--depth', type=int, default=0,
                     help='data subdirectory depth')
 
 parser.add_argument('-D', '--debug', action='store_true', default=False,
-                    help='Enable FUSE debugging mode')
+                    help='enable FUSE debugging mode')
 
 parser.add_argument('-b', '--background', action='store_true', default=False,
-                    help='Do not exit until the file system is unmounted')
+                    help='do not exit until the file system is unmounted')
+
+parser.add_argument('-s', '--single-threaded', action='store_true',
+                    default=False, help='do not run in multi-threaded mode')
 
 parser.add_argument('mount', help='mount point')
 
@@ -705,4 +713,4 @@ if __name__ == '__main__':
 
     fuse = FUSE(ExplodedZip(base=args.directory, depth=args.depth),
                 args.mount, foreground=not args.background, ro=True,
-                debug=args.debug)
+                debug=args.debug, nothreads=args.single_threaded)
