@@ -1,7 +1,16 @@
 #!/usr/bin/env python
 # vim: set fileencoding=utf-8 :
 
+import errno
+import fuse
+import os
+import stat
+import time
+
 from binascii import b2a_hex
+from collections import namedtuple
+from fuse import FUSE, FuseOSError, LoggingMixIn, Operations
+from glob import iglob
 from io import BytesIO
 from os import path
 from struct import Struct
@@ -57,12 +66,197 @@ class SeekTree(object):
             return self.right.find(offset)
 
 
-def _read_jump_file(file):
-    while True:
-        item = file.read(JUMP_ITEM.size)
-        if not item: break
+def _unpack_stream(stream, struct):
+    return (struct.unpack(item)
+            for item in iter(lambda: stream.read(struct.size), b''))
 
-        yield JUMP_ITEM.unpack(item)
+ExplodedInfo = namedtuple('ExplodedInfo',
+                          'filesize directory_offset jump_tree')
+
+class ExplodedZip(Operations):
+    def __init__(self):
+        self._load_time = time.time()
+        self.__exploded_info = {}
+
+    def _exploded_info(self, path):
+        if path in self.__exploded_info: return self.__exploded_info[path]
+
+        jump_name = os.path.join('meta', os.path.basename(path) + '.jump')
+        with open(jump_name, 'rb') as jump:
+            filesize, dir_offset = JUMP_ITEM.unpack(jump.read(JUMP_ITEM.size))
+            tree = SeekTree.load(_unpack_stream(jump, JUMP_ITEM))
+
+            info = self.__exploded_info[path] = ExplodedInfo(filesize,
+                                                             dir_offset, tree)
+
+            return info
+
+    @staticmethod
+    def _metafiles(path):
+        meta = os.path.join('meta', os.path.basename(path))
+        return [meta + suffix for suffix in ('.dir', '.stream', '.jump')]
+
+    @staticmethod
+    def _not_supported(*args, **kargs):
+        raise FuseOSError(fuse.ENOTSUP)
+
+    def access(self, path, amode):
+        # this is a read only file system
+        if amode & os.W_OK: return -errno.EACCES
+        if path == '/': return 0
+
+        # as long as the user is able to access all of the meta files it's ok
+        if all(os.access(f, amode) for f in self._metafiles(path)):
+            return 0
+        else:
+            return -errno.EACCES
+
+    def chmod(self, path, mode):
+        if path == '/': return -errno.EACCES
+
+        file_info = [(f, os.stat(f).st_mode) for f in self._metafiles(path)]
+
+        try:
+            for filename, current_mode in file_info:
+                if current_mode != mode:
+                    os.chmod(filename, mode)
+        except:
+            try:
+                for filename, previous_mode in file_info:
+                    if os.stat(filename).st_mode != previous_mode:
+                        os.chmod(filename, previous_mode)
+            except:
+                # there's not really anything we can do at this point
+                pass
+
+            return -errno.EACCES
+        return 0
+
+    def chown(self, path, gid, uid):
+        if path == '/': return -errno.EACCES
+
+        file_info = [(f, os.stat(f)) for f in self._metafiles(path)]
+
+        try:
+            for filename, stat in file_info:
+                if gid != stat.st_gid or uid != stat.st_uid:
+                    os.chown(filename, gid, uid)
+        except:
+            try:
+                for filename, previous in file_info:
+                    current = os.stat(filename)
+
+                    if (current.st_gid != previous.st_gid or
+                        current_mode.st_uid != previous.st_uid):
+
+                        os.chown(filename, previous.st_gid, previous.st_uid)
+
+            except:
+                # there's not really anything we can do at this point
+                pass
+
+            return -errno.EACCES
+        return 0
+
+    create = _not_supported
+
+    def destroy(self, path):
+        self.__exploded_info = {}
+
+    def getattr(self, path, fh=None):
+        if path == '/':
+            uid, gid, pid = fuse.fuse_get_context()
+
+            return {
+                'st_uid': uid,
+                'st_gid': gid,
+                'st_mode': stat.S_IFDIR | 0555,
+                'st_nlink': 2,
+
+                'st_atime': self._load_time,
+                'st_mtime': self._load_time,
+                'st_ctime': self._load_time,
+            }
+        else:
+            stats = [os.stat(f) for f in self._metafiles(path)]
+
+            # bitwise OR of all the modes
+            mode = reduce(lambda a, b: a | (b.st_mode & 0777), stats, 0)
+
+            return {
+                'st_uid': stats[0].st_uid,
+                'st_gid': stats[0].st_gid,
+                'st_mode': stat.S_IFREG |  mode,
+                'st_size': self._exploded_info(path).filesize,
+                'st_nlink': min(i.st_nlink for i in stats),
+
+                'st_atime': max(i.st_atime for i in stats),
+                'st_mtime': max(i.st_mtime for i in stats),
+                'st_ctime': max(i.st_ctime for i in stats),
+            }
+
+
+    def link(self, target, source):
+        for t, s in zip(self._metafiles(target), self._metafiles(source)):
+            if not path.isfile(t) or not path.samefile(s, t):
+                os.link(s, t)
+
+    listxattr = _not_supported
+    mkdir = _not_supported
+    mknod = _not_supported
+
+    # TODO: open
+    # TODO: read
+    def readdir(self, path, fh):
+        if path != '/':
+            raise FuseOSError(errno.ENOTDIR)
+
+        yield '.'
+        yield '..'
+        for entry in iglob('meta/*.dir'):
+            yield os.path.basename(entry[:-4])
+
+    def readlink(self, path):
+        for meta in self._metafiles(path):
+            link = os.readlink(meta)
+
+            try:
+                name, ext = link.rsplit('.', 1)
+
+                if meta.rsplit('.', 1)[1] == ext:
+                    return name
+            except ValueError:
+                continue
+
+        return -errno.EINVAL
+
+    # TODO: release (close?)
+
+    removexattr = _not_supported
+    rename = _not_supported
+    rmdir = _not_supported
+
+    def statfs(self, path):
+        # TODO: report better information
+        stat = os.statvfs('meta')
+        return dict((key, getattr(stat, key)) for key in
+                    ('f_bavail', 'f_bfree', 'f_blocks', 'f_bsize'))
+
+    def symlink(self, target, source):
+        for t, s in zip(self._metafiles(target), self._metafiles(source)):
+            if not path.islink(t) or os.readlink(t) != s:
+                os.symlink(s, t)
+
+    truncate = _not_supported
+    unlink = _not_supported
+
+    def utimens(self, path, time=None):
+        for filename in self._metafiles(path):
+            os.utime(filename, time)
+
+    write = _not_supported
+
+
 
 def _read_stream(stream, offset=0, count=-1):
     if offset < 0:
@@ -137,7 +331,6 @@ def _read_stream(stream, offset=0, count=-1):
 
 def read(filename, offset=0, count=-1, begining=True):
     meta = path.join('meta', filename)
-    data = path.join('data', filename)
 
     with open(meta + '.jump', 'rb') as jump:
         with open(meta + '.dir', 'rb') as dir:
@@ -145,7 +338,7 @@ def read(filename, offset=0, count=-1, begining=True):
                 header = JUMP_ITEM.unpack(jump.read(JUMP_ITEM.size))
                 filesize, directory_offset = header
 
-                tree = SeekTree.load(_read_jump_file(jump))
+                tree = SeekTree.load(_unpack_stream(jump, JUMP_ITEM))
 
                 if not begining:
                     offset += filesize
@@ -178,4 +371,4 @@ def read(filename, offset=0, count=-1, begining=True):
 if __name__ == '__main__':
     import sys
 
-    sys.stdout.write(read(sys.argv[1]))
+    fuse = FUSE(ExplodedZip(), sys.argv[1], foreground=True, ro=True)
