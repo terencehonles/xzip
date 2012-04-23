@@ -7,17 +7,25 @@ import os
 import stat
 import time
 
+from argparse import ArgumentParser
 from binascii import b2a_hex
 from collections import namedtuple
 from fuse import FUSE, FuseOSError, LoggingMixIn, Operations
-from glob import iglob
-from io import BytesIO
+from io import BufferedReader, BytesIO, FileIO, RawIOBase
 from os import path
 from struct import Struct
 
 ZIP_STREAM_ITEM = Struct('<4s5H3L2H')
+DESCRIPTOR = Struct('<3L')
 STREAM_ITEM = Struct('<4s5H3L2HB20s')
 JUMP_ITEM = Struct('<2Q')
+HEADER_DIFF = ZIP_STREAM_ITEM.size - STREAM_ITEM.size
+
+Descriptor = namedtuple('Descriptor', 'crc compressed_size raw_size')
+StreamItem = namedtuple('StreamItem',
+        ('signature', 'needed_version', 'flag', 'compression',
+         'mod_time', 'mod_date', 'crc', 'compressed_size', 'raw_size',
+         'filename_len', 'extra_field_len', 'descriptor_len', 'sha'))
 
 class SeekTree(object):
     __slots__ = ('location', 'left', 'right')
@@ -74,14 +82,20 @@ ExplodedInfo = namedtuple('ExplodedInfo',
                           'filesize directory_offset jump_tree')
 
 class ExplodedZip(Operations):
-    def __init__(self):
+    def __init__(self, base='.', depth=0):
+        self.base = path.realpath(base)
+        self.depth = depth
         self._load_time = time.time()
         self.__exploded_info = {}
+        self.__handles = {}
+        self.__fh = 0
 
     def _exploded_info(self, path):
         if path in self.__exploded_info: return self.__exploded_info[path]
 
-        jump_name = os.path.join('meta', os.path.basename(path) + '.jump')
+        jump_name = os.path.join(self.base, 'meta',
+                                 os.path.basename(path) + '.jump')
+
         with open(jump_name, 'rb') as jump:
             filesize, dir_offset = JUMP_ITEM.unpack(jump.read(JUMP_ITEM.size))
             tree = SeekTree.load(_unpack_stream(jump, JUMP_ITEM))
@@ -91,9 +105,8 @@ class ExplodedZip(Operations):
 
             return info
 
-    @staticmethod
-    def _metafiles(path):
-        meta = os.path.join('meta', os.path.basename(path))
+    def _metafiles(self, path):
+        meta = os.path.join(self.base, 'meta', os.path.basename(path))
         return [meta + suffix for suffix in ('.dir', '.stream', '.jump')]
 
     @staticmethod
@@ -162,6 +175,7 @@ class ExplodedZip(Operations):
 
     def destroy(self, path):
         self.__exploded_info = {}
+        self.__handles = {}
 
     def getattr(self, path, fh=None):
         if path == '/':
@@ -205,16 +219,30 @@ class ExplodedZip(Operations):
     mkdir = _not_supported
     mknod = _not_supported
 
-    # TODO: open
-    # TODO: read
+    def open(self, path, flags):
+        raw = File(path, flags, self._exploded_info(path), fh=self.__fh,
+                   base=self.base, depth=self.depth)
+
+        self.__handles[self.__fh] = BufferedReader(raw)
+
+        self.__fh += 1
+        return raw.fh
+
+    def read(self, path, size, offset, fh):
+        reader = self.__handles[fh]
+
+        reader.seek(offset)
+        return reader.read(size)
+
     def readdir(self, path, fh):
         if path != '/':
             raise FuseOSError(errno.ENOTDIR)
 
         yield '.'
         yield '..'
-        for entry in iglob('meta/*.dir'):
-            yield os.path.basename(entry[:-4])
+        for entry in os.listdir(os.path.join(self.base, 'meta')):
+            if entry.endswith('.dir'):
+                yield os.path.basename(entry[:-4])
 
     def readlink(self, path):
         for meta in self._metafiles(path):
@@ -230,7 +258,8 @@ class ExplodedZip(Operations):
 
         return -errno.EINVAL
 
-    # TODO: release (close?)
+    def release(self, path, fh):
+        del self.__handles[fh]
 
     removexattr = _not_supported
     rename = _not_supported
@@ -238,7 +267,7 @@ class ExplodedZip(Operations):
 
     def statfs(self, path):
         # TODO: report better information
-        stat = os.statvfs('meta')
+        stat = os.statvfs(os.path.join(self.base, 'meta'))
         return dict((key, getattr(stat, key)) for key in
                     ('f_bavail', 'f_bfree', 'f_blocks', 'f_bsize'))
 
@@ -258,7 +287,7 @@ class ExplodedZip(Operations):
 
 
 
-def _read_stream(stream, offset=0, count=-1):
+def _read_stream(stream, offset=0, count=-1, base='.', depth=0):
     if offset < 0:
         raise ValueError('offset %r should be greater than zero' % offset)
 
@@ -273,6 +302,8 @@ def _read_stream(stream, offset=0, count=-1):
         var_fields = header[9] + header[10]
         descriptor_len = header[11]
         sha1 = b2a_hex(header[12])
+
+        data_name = path.join(*([base, 'data'] + list(sha1[:depth]) + [sha1]))
 
         if offset:
             if offset < ZIP_STREAM_ITEM.size:
@@ -293,7 +324,7 @@ def _read_stream(stream, offset=0, count=-1):
                 out.seek(0)
                 return out.read(count)
 
-            with open(path.join('data', sha1), 'rb') as data:
+            with open(data_name, 'rb') as data:
                 if count > 0:
                     out.write(data.read(count - out.tell()))
                 else:
@@ -313,7 +344,7 @@ def _read_stream(stream, offset=0, count=-1):
                 out.seek(0)
                 return out.read(count)
 
-            with open(path.join('data', sha1), 'rb') as data:
+            with open(data_name, 'rb') as data:
                 if count > 0:
                     out.write(data.read(count - out.tell()))
                 else:
@@ -329,8 +360,8 @@ def _read_stream(stream, offset=0, count=-1):
     out.seek(0)
     return out.read()
 
-def read(filename, offset=0, count=-1, begining=True):
-    meta = path.join('meta', filename)
+def read(filename, offset=0, count=-1, begining=True, base='.', depth=0):
+    meta = path.join(base, 'meta', filename)
 
     with open(meta + '.jump', 'rb') as jump:
         with open(meta + '.dir', 'rb') as dir:
@@ -357,7 +388,8 @@ def read(filename, offset=0, count=-1, begining=True):
                     offset -= pos[0]
                     stream.seek(pos[1])
 
-                s = _read_stream(stream, offset, count)
+                s = _read_stream(stream, offset=offset, count=count,
+                                 base=base, depth=depth)
 
                 if count > 0:
                     if len(s) >= count:
@@ -368,7 +400,309 @@ def read(filename, offset=0, count=-1, begining=True):
                 return s + dir.read()
 
 
-if __name__ == '__main__':
-    import sys
+class File(RawIOBase):
+    HEADER = 0
+    DATA = 1
+    DESCRIPTOR = 2
+    DIRECTORY = 3
 
-    fuse = FUSE(ExplodedZip(), sys.argv[1], foreground=True, ro=True)
+    def __init__(self, path, flags, info, fh=None, base='.', depth=0):
+        super(File, self).__init__()
+
+        self.path = path
+        self.flags = flags
+        self.fh = fh
+
+        self.info = info
+        self.depth = depth
+        self.cursor = 0
+        self.offset = 0
+        self.state = File.HEADER
+
+        # stream item info
+        self.stream_offset = 0
+        self.zip_header = b''
+        self.descriptor = b''
+
+        # data file info
+        self.data = None
+        self.data_name = ''
+        self.data_len = 0
+
+        # streams
+        prefix = os.path.join(base, 'meta', os.path.basename(path))
+        self.stream = FileIO(prefix + '.stream', 'rb')
+        self.dir = FileIO(prefix + '.dir', 'rb')
+        self.data_dir = os.path.join(base, 'data')
+
+        # init
+        self._load_stream_item()
+
+    def _load_stream_item(self):
+        if self.data:
+            self.data.close()
+            self.data = None
+
+        # open the header so we can know the data file to open, and the
+        # length of the var fields
+        raw_header = self.stream.read(STREAM_ITEM.size)
+        header = StreamItem._make(STREAM_ITEM.unpack(raw_header))
+
+        var_fields = header.filename_len + header.extra_field_len
+        sha1 = b2a_hex(header.sha)
+
+        # only save the zip part of the header
+        self.zip_header = (raw_header[:HEADER_DIFF] +
+                           self.stream.read(var_fields))
+
+        self.descriptor = self.stream.read(header.descriptor_len)
+
+        self.data_name = path.join(*([self.data_dir] +
+                                     list(sha1[:self.depth]) + [sha1]))
+
+    def _open_data_file(self):
+        self.data = FileIO(self.data_name, 'rb')
+        self.data_len = self.data.seek(0, 2)
+        self.data.seek(0)
+
+    def close(self):
+        self.stream.close()
+        self.dir.close()
+        if self.data: self.data.close()
+
+    def fileno(self):
+        return self.fh
+
+    def isatty(self):
+        return False
+
+    def read(self, count=-1):
+        if count < 0: return self.readall()
+        elif count == 0: return b''
+
+        state = self.state
+        if state == File.HEADER:
+            previous_offset = self.offset
+            self.offset += count
+
+            result = self.zip_header[previous_offset:self.offset]
+            self.cursor += len(result)
+
+            if self.offset >= len(self.zip_header):
+                self.state = File.DATA
+                if not self.data: self._open_data_file()
+
+            return result
+
+        elif state == File.DATA:
+            result = self.data.read(count)
+            self.cursor += len(result)
+
+            if self.data.tell() >= self.data_len:
+                self.state = File.DESCRIPTOR
+                self.offset = 0
+
+            # empty data file (state will now be DESCRIPTOR)
+            if not result: return self.read(count)
+
+            return result
+
+        elif state == File.DESCRIPTOR:
+            previous_offset = self.offset
+            self.offset += count
+
+            result = self.descriptor[previous_offset:self.offset]
+            self.cursor += len(result)
+
+            if self.offset >= len(self.descriptor):
+                if self.cursor >= self.info.directory_offset:
+                    self.state = File.DIRECTORY
+                    self.dir.seek(0)
+                    self.stream_offset = None
+
+                    if self.data:
+                        self.data.close()
+                        self.data = None
+
+                else:
+                    self.state = File.HEADER
+                    self.offset = 0
+                    self.stream_offset = self.stream.tell()
+                    self._load_stream_item()
+
+            # descriptor is optional (state will now be HEADER or DIRECTORY)
+            if not result: return self.read(count)
+
+            return result
+        elif state == File.DIRECTORY:
+            result = self.dir.read(count)
+            self.cursor += len(result)
+
+            return result
+        else:
+            raise RuntimeError('Invalid state: %r' % self.state)
+
+    def readable(self):
+        return True
+
+    def readinto(self, b):
+        count = len(b)
+        if count == 0: return 0
+
+        state = self.state
+        if state == File.HEADER:
+            header_len = len(self.zip_header)
+            previous_offset = self.offset
+
+            current_offset = self.offset = \
+                    min(previous_offset + count, header_len)
+
+            read = current_offset - previous_offset
+            b[:read] = self.zip_header[previous_offset:current_offset]
+            self.cursor += read
+
+            if current_offset == header_len:
+                self.state = File.DATA
+                if not self.data: self._open_data_file()
+
+            return read
+
+        elif state == File.DATA:
+            read = self.data.readinto(b)
+            self.cursor += read
+
+            if self.data.tell() >= self.data_len:
+                self.state = File.DESCRIPTOR
+                self.offset = 0
+
+            # empty data file (state will now be DESCRIPTOR)
+            if not read: return self.readinto(b)
+
+            return read
+
+        elif state == File.DESCRIPTOR:
+            descriptor_len = len(self.descriptor)
+            previous_offset = self.offset
+
+            current_offset = self.offset = \
+                    min(previous_offset + count, descriptor_len)
+
+            read = current_offset - previous_offset
+            b[:read] = self.descriptor[previous_offset:current_offset]
+            self.cursor += read
+
+            if current_offset == descriptor_len:
+                if self.cursor >= self.info.directory_offset:
+                    self.state = File.DIRECTORY
+                    self.dir.seek(0)
+                    self.stream_offset = None
+
+                    if self.data:
+                        self.data.close()
+                        self.data = None
+
+                else:
+                    self.state = File.HEADER
+                    self.offset = 0
+                    self.stream_offset = self.stream.tell()
+                    self._load_stream_item()
+
+            # descriptor is optional (state will now be HEADER or DIRECTORY)
+            if not read: return self.readinto(b)
+
+            return read
+        elif state == File.DIRECTORY:
+            read = self.dir.readinto(b)
+            self.cursor += read
+
+            return read
+        else:
+            raise RuntimeError('Invalid state: %r' % self.state)
+
+    def seek(self, pos, offset=0):
+        if offset == 1:
+            pos += self.cursor
+        elif offset == 2:
+            pos += self.info.filesize
+
+        if pos == self.cursor: return pos
+        self.cursor = pos
+
+        # skip directly to the central directory
+        if pos >= self.info.directory_offset:
+            if self.data:
+                self.data.close()
+                self.data = None
+
+            self.state = File.DIRECTORY
+            self.stream_offset = None
+            self.dir.seek(pos - self.info.directory_offset)
+            return pos
+
+        # calculate the offset into the stream file
+        z_offset, s_offset = self.info.jump_tree.find(pos).location
+        additional = pos - z_offset
+
+        # we're looking at a different data file
+        # (load local header into memory)
+        if s_offset != self.stream_offset:
+            self.stream_offset = s_offset
+            self.stream.seek(s_offset)
+            self._load_stream_item()
+
+        header_len = len(self.zip_header)
+        if additional < header_len:
+            self.state = File.HEADER
+            self.offset = additional
+            return pos
+
+        # assume currently in the data file
+        additional -= header_len
+        self.state = File.DATA
+
+        # if the file hasn't been opened yet, open it and find its size
+        if not self.data: self._open_data_file()
+
+        if additional < self.data_len:
+            self.data.seek(additional)
+        else:
+            self.state = File.DESCRIPTOR
+            self.offset = additional - self.data_len
+
+        return pos
+
+    def seekable(self):
+        return True
+
+    def tell(self):
+        return self.cursor
+
+    def writeable(self):
+        return False
+
+
+
+
+parser = ArgumentParser(description='Exposes exploded zip file(s) as a FUSE '
+                                    'file system.')
+
+parser.add_argument('-d', '--directory', metavar='DIR', default='.',
+                    help='alternate base for the exploded files')
+
+parser.add_argument('--depth', type=int, default=0,
+                    help='data subdirectory depth')
+
+parser.add_argument('-D', '--debug', action='store_true', default=False,
+                    help='Enable FUSE debugging mode')
+
+parser.add_argument('-b', '--background', action='store_true', default=False,
+                    help='Do not exit until the file system is unmounted')
+
+parser.add_argument('mount', help='mount point')
+
+if __name__ == '__main__':
+    args = parser.parse_args()
+
+    fuse = FUSE(ExplodedZip(base=args.directory, depth=args.depth),
+                args.mount, foreground=not args.background, ro=True,
+                debug=args.debug)
