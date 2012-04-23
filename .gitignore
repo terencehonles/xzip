@@ -1,0 +1,17 @@
+*.py[oc]
+*~
+*.swp
+/bin/easy_install
+/bin/easy_install-2.7
+/bin/pip
+/bin/pip-2.7
+/include
+/lib
+/lib64
+/system
+/bin/activate
+/bin/activate.csh
+/bin/activate.fish
+/bin/activate_this.py
+/bin/python
+/bin/xattr
