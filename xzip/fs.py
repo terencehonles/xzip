@@ -16,6 +16,10 @@ from io import BufferedReader, BytesIO, FileIO, RawIOBase
 from os import path
 from struct import Struct
 
+__all__ = ('ZIP_STREAM_ITEM', 'DESCRIPTOR', 'STREAM_ITEM', 'JUMP_ITEM',
+           'HEADER_DIFF', 'Descriptor', 'ExplodedInfo', 'ExplodedZip', 'File',
+           'StreamItem', 'SeekTree',  'parser')
+
 ZIP_STREAM_ITEM = Struct('<4s5H3L2H')
 DESCRIPTOR = Struct('<3L')
 STREAM_ITEM = Struct('<4s5H3L2HB20s')
@@ -340,7 +344,8 @@ class File(RawIOBase):
         header = StreamItem._make(STREAM_ITEM.unpack(raw_header))
 
         var_fields = header.filename_len + header.extra_field_len
-        sha1 = b2a_hex(header.sha)
+        # I would think that b2a_hex should decode the raw bytes...
+        sha1 = b2a_hex(header.sha).decode('ascii')
 
         # only save the zip part of the header
         self.zip_header = (raw_header[:HEADER_DIFF] +
@@ -594,9 +599,12 @@ parser.add_argument('-s', '--single-threaded', action='store_true',
 
 parser.add_argument('mount', help='mount point')
 
-if __name__ == '__main__':
+def main():
     args = parser.parse_args()
 
     fuse = FUSE(ExplodedZip(base=args.directory, depth=args.depth),
                 args.mount, foreground=not args.background, ro=True,
                 debug=args.debug, nothreads=args.single_threaded)
+
+if __name__ == '__main__':
+    main()
