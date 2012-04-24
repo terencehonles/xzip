@@ -11,6 +11,8 @@ from collections import namedtuple
 from hashlib import sha1
 from os import path
 
+__all__ = ('CENTRAL_DIR', 'END_OF_DIR', 'LOCAL_HEADER', 'DATA_DESCRIPTOR',
+           'STREAM_ITEM', 'JUMP_ITEM', 'parser', 'process_zip', 'process_file')
 
 class _Struct(struct.Struct):
     __slots__ = ('marker', '_named_ctor')
@@ -164,8 +166,12 @@ parser.add_argument('--depth', type=int, default=0,
 parser.add_argument('filenames', metavar='FILE', nargs='+',
                     help='zip files to process')
 
-if __name__ == '__main__':
+
+def main():
     args = parser.parse_args()
 
     for filename in args.filenames:
         process_zip(filename, depth=args.depth, base=args.directory)
+
+if __name__ == '__main__':
+    main()

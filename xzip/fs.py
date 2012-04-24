@@ -16,6 +16,10 @@ from io import BufferedReader, BytesIO, FileIO, RawIOBase
 from os import path
 from struct import Struct
 
+__all__ = ('ZIP_STREAM_ITEM', 'DESCRIPTOR', 'STREAM_ITEM', 'JUMP_ITEM',
+           'HEADER_DIFF', 'Descriptor', 'ExplodedInfo', 'ExplodedZip', 'File',
+           'StreamItem', 'SeekTree',  'parser')
+
 ZIP_STREAM_ITEM = Struct('<4s5H3L2H')
 DESCRIPTOR = Struct('<3L')
 STREAM_ITEM = Struct('<4s5H3L2HB20s')
@@ -594,9 +598,12 @@ parser.add_argument('-s', '--single-threaded', action='store_true',
 
 parser.add_argument('mount', help='mount point')
 
-if __name__ == '__main__':
+def main():
     args = parser.parse_args()
 
     fuse = FUSE(ExplodedZip(base=args.directory, depth=args.depth),
                 args.mount, foreground=not args.background, ro=True,
                 debug=args.debug, nothreads=args.single_threaded)
+
+if __name__ == '__main__':
+    main()

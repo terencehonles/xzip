@@ -9,6 +9,9 @@ import zlib
 from collections import namedtuple
 from hashlib import sha1
 
+__all__ = ('CENTRAL_DIR', 'END_OF_DIR', 'LOCAL_HEADER', 'DATA_DESCRIPTOR',
+           'process_zip')
+
 class _Struct(struct.Struct):
     __slots__ = ('marker', '_named_ctor')
 
@@ -118,5 +121,8 @@ def process_file(file, info):
             sha1(decompressed).hexdigest())
 
 
-if __name__ == '__main__':
+def main():
     process_zip(sys.argv[1])
+
+if __name__ == '__main__':
+    main()
