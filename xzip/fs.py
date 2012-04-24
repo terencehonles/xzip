@@ -344,7 +344,8 @@ class File(RawIOBase):
         header = StreamItem._make(STREAM_ITEM.unpack(raw_header))
 
         var_fields = header.filename_len + header.extra_field_len
-        sha1 = b2a_hex(header.sha)
+        # I would think that b2a_hex should decode the raw bytes...
+        sha1 = b2a_hex(header.sha).decode('ascii')
 
         # only save the zip part of the header
         self.zip_header = (raw_header[:HEADER_DIFF] +
