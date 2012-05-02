@@ -14,7 +14,7 @@ with open('README') as readme:
 
 setup(
         name = 'xzip',
-        version = '0.9',
+        version = '0.10',
         packages = find_packages(),
 
         install_requires = ['fusepy>=1.1'],
@@ -25,6 +25,7 @@ setup(
         long_description = documentation,
         license = 'PSF',
         keywords = 'FS FileSystem File System Zip Deduplication',
+        url = 'https://github.com/terencehonles/xzip',
 
         entry_points = {
             'console_scripts': [

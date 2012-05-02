@@ -31,10 +31,16 @@ The file structure for an exploded zip is the following::
         ├── name-of-zip.zip.jump
         └── name-of-zip.zip.stream
 
+The file structure would be mounted by::
 
-Data files may be shared between an arbitrary number of exploded zips files,
-and the meta tuple (``*.dir``, ``*.jump``, ``*.stream``) describe the original
-zip file.
+    $ mount.xzip . path/to/mount/point
+    $ ls path/to/mount/point
+    name-of-zip.zip
+
+
+Data files may be shared between any number of exploded zips files, and the
+meta tuple (``*.dir``, ``*.jump``, ``*.stream``) describe the original zip
+file.
 
 
 ``zipexplode`` accepts two options ``--directory`` and ``--depth`` to modify
@@ -49,9 +55,12 @@ what needed to be stored per zip file. This executable is mainly of historical
 use.
 
 ``mount.xzip`` will mount the directory structure described above, and needs to
-be supplied with matching ``--directory`` and ``--depth`` arguments to when
-``zipexplode`` was called.  Additional arguments ``--debug``, ``--background``,
-and ``--single-threaded`` which are passed to FUSE_ and control underlying
+be supplied with matching ``directory`` and ``--depth`` arguments to when
+``zipexplode`` was called.  Additional arguments ``--debug``, ``--foreground``,
+and ``--single-threaded`` are passed to FUSE_ and control underlying
 functionality. For more information see the ``--help`` for ``mount.xzip``.
+(``mount.xzip`` also takes ``-o`` style options)
+
+**Note: At this time  xzip is not zip64 safe**
 
 .. _FUSE: http://fuse.sourceforge.net/

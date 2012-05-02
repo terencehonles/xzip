@@ -4,9 +4,11 @@
 import errno
 import fuse
 import os
+import signal
 import stat
 import threading
 import time
+import weakref
 
 from argparse import ArgumentParser
 from binascii import b2a_hex
@@ -33,6 +35,11 @@ StreamItem = namedtuple('StreamItem',
          'filename_len', 'extra_field_len', 'descriptor_len', 'sha'))
 
 class SeekTree(object):
+    '''
+    Create an object which maps a source offset range to a destination
+    offset supporting logarithmic read access.
+    '''
+
     __slots__ = ('location', 'left', 'right')
 
     def __init__(self, location, left=None, right=None):
@@ -42,6 +49,11 @@ class SeekTree(object):
 
     @staticmethod
     def load(iterator):
+        '''
+        Create a ``SeekTree`` from a sorted sequence of pairs
+        (source, destination)
+        '''
+
         last_level = ((SeekTree(i), i[0]) for i in iterator)
         top_level = []
         loop = True
@@ -71,6 +83,8 @@ class SeekTree(object):
             return
 
     def find(self, offset):
+        'Finds the original range mapping that ``offset`` specifies'
+
         if isinstance(self.location, tuple):
             return self
         elif offset < self.location:
@@ -87,6 +101,7 @@ ExplodedInfo = namedtuple('ExplodedInfo',
                           'filesize directory_offset jump_tree')
 
 class ExplodedZip(Operations):
+    'Create an E[x]ploded Zip FUSE handler'
     def __init__(self, base='.', depth=0):
         self.base = path.realpath(base)
         self.depth = depth
@@ -97,7 +112,11 @@ class ExplodedZip(Operations):
         self.__fh_lock = threading.Lock()
 
     def _exploded_info(self, path):
-        if path in self.__exploded_info: return self.__exploded_info[path]
+        'Loads the jump list and file info into memory'
+
+        # safer with _reset and _release
+        info = self.__exploded_info.get(path)
+        if info: return info
 
         jump_name = os.path.join(self.base, 'meta',
                                  os.path.basename(path) + '.jump')
@@ -118,6 +137,23 @@ class ExplodedZip(Operations):
     @staticmethod
     def _not_supported(*args, **kargs):
         raise FuseOSError(fuse.ENOTSUP)
+
+    def _release(self):
+        'Releases all unused meta data information'
+
+        with self.__fh_lock:
+            if not self.__handles: self.__fh = 0
+
+        self.__exploded_info = \
+                dict(weakref.WeakValueDictionary(self.__exploded_info))
+
+    def _reset(self):
+        'Releases all meta data information'
+
+        with self.__fh_lock:
+            if not self.__handles: self.__fh = 0
+
+        self.__exploded_info = {}
 
     def access(self, path, amode):
         # this is a read only file system
@@ -227,6 +263,8 @@ class ExplodedZip(Operations):
 
     def open(self, path, flags):
         with self.__fh_lock:
+            if not self.__handles: self.__fh = 0
+
             raw = File(path, flags, self._exploded_info(path), fh=self.__fh,
                        base=self.base, depth=self.depth)
 
@@ -295,6 +333,8 @@ class ExplodedZip(Operations):
 
 
 class File(RawIOBase):
+    'Create a file object wrapping an e[x]ploded zip file'
+
     HEADER = 0
     DATA = 1
     DESCRIPTOR = 2
@@ -334,6 +374,8 @@ class File(RawIOBase):
         self.lock = threading.Lock()
 
     def _load_stream_item(self):
+        'Sets the next stream item as current.'
+
         if self.data:
             self.data.close()
             self.data = None
@@ -582,29 +624,53 @@ class File(RawIOBase):
 parser = ArgumentParser(description='Exposes exploded zip file(s) as a FUSE '
                                     'file system.')
 
-parser.add_argument('-d', '--directory', metavar='DIR', default='.',
-                    help='alternate base for the exploded files')
-
-parser.add_argument('--depth', type=int, default=0,
+parser.add_argument('-d', '--depth', type=int, default=0,
                     help='data subdirectory depth')
 
 parser.add_argument('-D', '--debug', action='store_true', default=False,
                     help='enable FUSE debugging mode')
 
-parser.add_argument('-b', '--background', action='store_true', default=False,
+parser.add_argument('-f', '--foreground', action='store_true', default=False,
                     help='do not exit until the file system is unmounted')
 
 parser.add_argument('-s', '--single-threaded', action='store_true',
                     default=False, help='do not run in multi-threaded mode')
 
+parser.add_argument('-o', action='append', metavar='OPTIONS', default=None,
+                    help='''"traditional" mount style options
+                            (high priorty, but full spelling required),
+                            --single-threaded -> nothread''')
+
+parser.add_argument('directory', help='base for the exploded files')
 parser.add_argument('mount', help='mount point')
 
-def main():
-    args = parser.parse_args()
+def parse_o_options(options):
+    for item in ','.join(options).split(','):
+        try:
+            k, v = item.split('=', 1)
+        except ValueError:
+            k, v = item, True
 
-    fuse = FUSE(ExplodedZip(base=args.directory, depth=args.depth),
-                args.mount, foreground=not args.background, ro=True,
-                debug=args.debug, nothreads=args.single_threaded)
+        yield k, v
+
+def main():
+    'mounts an e[x]ploded zip file system'
+
+    args = parser.parse_args()
+    opts = dict(parse_o_options(args.o or []))
+
+    if 'depth' in opts: args.depth = int(opts['depth'])
+    if 'debug' in opts: args.debug = True
+    if 'foreground' in opts: args.foreground = True
+    if 'nothread' in opts: args.single_threaded = True
+
+    operations = ExplodedZip(base=args.directory, depth=args.depth)
+
+    def release(*_): operations._release()
+    signal.signal(signal.SIGHUP, release)
+
+    fuse = FUSE(operations, args.mount, foreground=args.foreground,
+                ro=True, debug=args.debug, nothreads=args.single_threaded)
 
 if __name__ == '__main__':
     main()
